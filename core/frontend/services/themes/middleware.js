@@ -7,6 +7,7 @@ const errors = require('@tryghost/errors');
 const settingsCache = require('../../../server/services/settings/cache');
 const labs = require('../../../server/services/labs');
 const activeTheme = require('./active');
+const preview = require('./preview');
 
 // ### Ensure Active Theme
 // Ensure there's a properly set & mounted active theme before attempting to serve a site request
@@ -47,14 +48,6 @@ function ensureActiveTheme(req, res, next) {
  * members settings as publicly readable
  */
 function haxGetMembersPriceData() {
-    const CURRENCY_SYMBOLS = {
-        USD: '$',
-        AUD: '$',
-        CAD: '$',
-        GBP: '£',
-        EUR: '€',
-        INR: '₹'
-    };
     const defaultPriceData = {
         monthly: 0,
         yearly: 0
@@ -67,14 +60,21 @@ function haxGetMembersPriceData() {
             const numberAmount = 0 + plan.amount;
             const dollarAmount = numberAmount ? Math.round(numberAmount / 100) : 0;
             return Object.assign(prices, {
-                [plan.name.toLowerCase()]: dollarAmount
+                [plan.name.toLowerCase()]: {
+                    valueOf() {
+                        return dollarAmount;
+                    },
+                    amount: numberAmount,
+                    currency: plan.currency,
+                    nickname: plan.name,
+                    interval: plan.interval
+                }
             });
         }, {});
 
         priceData.currency = stripePlans[0].currency;
-        priceData.currency_symbol = CURRENCY_SYMBOLS[priceData.currency.toUpperCase()];
 
-        if (Number.isInteger(priceData.monthly) && Number.isInteger(priceData.yearly)) {
+        if (Number.isInteger(priceData.monthly.valueOf()) && Number.isInteger(priceData.yearly.valueOf())) {
             return priceData;
         }
 
@@ -84,41 +84,11 @@ function haxGetMembersPriceData() {
     }
 }
 
-// The preview header contains a query string with the custom preview data
-// This is deliberately slightly obscure & means we don't need to add body parsing to the frontend :D
-// If we start passing in strings like title or description we will probably need to change this
-const PREVIEW_HEADER_NAME = 'x-ghost-preview';
-
-function handlePreview(previewHeader, siteData) {
-    // Keep the string shorter with short codes for certain parameters
-    const supportedSettings = {
-        c: 'accent_color',
-        icon: 'icon',
-        logo: 'logo',
-        cover: 'cover_image'
-    };
-
-    // @TODO: change this to use a proper query string parser - maybe build a fake url and use the url lib
-    let opts = decodeURIComponent(previewHeader).split('&');
-
-    opts.forEach((opt) => {
-        let [key, value] = opt.split('=');
-        if (supportedSettings[key]) {
-            _.set(siteData, supportedSettings[key], value);
-        }
-    });
-
-    siteData._preview = previewHeader;
-
-    return siteData;
-}
-
 function getSiteData(req) {
     let siteData = settingsCache.getPublic();
 
-    if (req.header(PREVIEW_HEADER_NAME)) {
-        siteData = handlePreview(req.header(PREVIEW_HEADER_NAME), siteData);
-    }
+    // @TODO: it would be nicer if this was proper middleware somehow...
+    siteData = preview.handle(req, siteData);
 
     return siteData;
 }
@@ -173,8 +143,12 @@ function updateLocalTemplateOptions(req, res, next) {
         name: req.member.name,
         firstname: req.member.name && req.member.name.split(' ')[0],
         avatar_image: req.member.avatar_image,
-        subscriptions: req.member.subscriptions,
-        paid: req.member.status === 'paid'
+        subscriptions: req.member.subscriptions && req.member.subscriptions.map((sub) => {
+            return Object.assign({}, sub, {
+                default_payment_card_last4: sub.default_payment_card_last4 || '****'
+            });
+        }),
+        paid: req.member.status !== 'free'
     } : null;
 
     hbs.updateLocalTemplateOptions(res.locals, _.merge({}, localTemplateOptions, {

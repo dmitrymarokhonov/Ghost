@@ -10,6 +10,7 @@ const htmlToPlaintext = require('../../shared/html-to-plaintext');
 const ghostBookshelf = require('./base');
 const config = require('../../shared/config');
 const settingsCache = require('../services/settings/cache');
+const limitService = require('../services/limits');
 const mobiledocLib = require('../lib/mobiledoc');
 const relations = require('./relations');
 const urlUtils = require('../../shared/url-utils');
@@ -77,6 +78,69 @@ Post = ghostBookshelf.Model.extend({
             targetTableName: 'emails',
             foreignKey: 'post_id'
         }
+    },
+
+    format() {
+        const attrs = ghostBookshelf.Model.prototype.format.apply(this, arguments);
+
+        // ensure all URLs are stored as transform-ready with __GHOST_URL__ representing config.url
+        const urlTransformMap = {
+            mobiledoc: 'mobiledocToTransformReady',
+            html: 'htmlToTransformReady',
+            plaintext: 'markdownToTransformReady',
+            custom_excerpt: 'htmlToTransformReady',
+            codeinjection_head: 'htmlToTransformReady',
+            codeinjection_foot: 'htmlToTransformReady',
+            feature_image: 'toTransformReady',
+            og_image: 'toTransformReady',
+            twitter_image: 'toTransformReady',
+            canonical_url: {
+                method: 'toTransformReady',
+                options: {
+                    ignoreProtocol: false
+                }
+            }
+        };
+
+        Object.entries(urlTransformMap).forEach(([attr, transform]) => {
+            let method = transform;
+            let transformOptions = {};
+
+            if (typeof transform === 'object') {
+                method = transform.method;
+                transformOptions = transform.options || {};
+            }
+
+            if (attrs[attr]) {
+                attrs[attr] = urlUtils[method](attrs[attr], transformOptions);
+            }
+        });
+
+        return attrs;
+    },
+
+    parse() {
+        const attrs = ghostBookshelf.Model.prototype.parse.apply(this, arguments);
+
+        // transform URLs from __GHOST_URL__ to absolute
+        [
+            'mobiledoc',
+            'html',
+            'plaintext',
+            'custom_excerpt',
+            'codeinjection_head',
+            'codeinjection_foot',
+            'feature_image',
+            'og_image',
+            'twitter_image',
+            'canonical_url'
+        ].forEach((attr) => {
+            if (attrs[attr]) {
+                attrs[attr] = urlUtils.transformReadyToAbsolute(attrs[attr]);
+            }
+        });
+
+        return attrs;
     },
 
     /**
@@ -417,39 +481,6 @@ Post = ghostBookshelf.Model.extend({
         if (!this.get('mobiledoc')) {
             this.set('mobiledoc', JSON.stringify(mobiledocLib.blankDocument));
         }
-
-        // ensure all URLs are stored as relative
-        // note: html is not necessary to change because it's a generated later from mobiledoc
-        const urlTransformMap = {
-            mobiledoc: 'mobiledocAbsoluteToRelative',
-            custom_excerpt: 'htmlAbsoluteToRelative',
-            codeinjection_head: 'htmlAbsoluteToRelative',
-            codeinjection_foot: 'htmlAbsoluteToRelative',
-            feature_image: 'absoluteToRelative',
-            og_image: 'absoluteToRelative',
-            twitter_image: 'absoluteToRelative',
-            canonical_url: {
-                method: 'absoluteToRelative',
-                options: {
-                    ignoreProtocol: false
-                }
-            }
-        };
-
-        Object.entries(urlTransformMap).forEach(([attrToTransform, transform]) => {
-            let method = transform;
-            let transformOptions = {};
-
-            if (typeof transform === 'object') {
-                method = transform.method;
-                transformOptions = transform.options || {};
-            }
-
-            if (this.hasChanged(attrToTransform) && this.get(attrToTransform)) {
-                const transformedValue = urlUtils[method](this.get(attrToTransform), transformOptions);
-                this.set(attrToTransform, transformedValue);
-            }
-        });
 
         // If we're force re-rendering we want to make sure that all image cards
         // have original dimensions stored in the payload for use by card renderers
@@ -1016,7 +1047,7 @@ Post = ghostBookshelf.Model.extend({
     },
 
     // NOTE: the `authors` extension is the parent of the post model. It also has a permissible function.
-    permissible: function permissible(postModel, action, context, unsafeAttrs, loadedPermissions, hasUserPermission, hasApiKeyPermission) {
+    permissible: async function permissible(postModel, action, context, unsafeAttrs, loadedPermissions, hasUserPermission, hasApiKeyPermission) {
         let isContributor;
         let isOwner;
         let isAdmin;
@@ -1047,6 +1078,13 @@ Post = ghostBookshelf.Model.extend({
         isEdit = (action === 'edit');
         isAdd = (action === 'add');
         isDestroy = (action === 'destroy');
+
+        if (limitService.isLimited('members')) {
+            // You can't publish a post if you're over your member limit
+            if ((isEdit && isChanging('status') && isDraft()) || (isAdd && isPublished())) {
+                await limitService.errorIfIsOverLimit('members');
+            }
+        }
 
         if (isContributor && isEdit) {
             // Only allow contributor edit if status is changing, and the post is a draft post
